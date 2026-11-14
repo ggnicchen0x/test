@@ -113,6 +113,7 @@ static NSString *AGLoadLastKey(void)       { return AGRead(kKeychainKeyAccount);
 
 // Forward decl — defined near the NSURLSession swizzle below.
 static void AGMarkAuthorized(NSString *token);
+static void AGSeedBundledPatches(void);
 
 // ---------------------------------------------------------------------------
 // Backend calls
@@ -522,6 +523,8 @@ static void AGHeartbeat(NSString *token, AGResult cb) {
                 } @catch (NSException *ex) {
                     NSLog(@"[AuthGate] onSuccess threw: %@", ex);
                 }
+                @try { AGSeedBundledPatches(); }
+                @catch (NSException *ex) { NSLog(@"[AuthGate] seed threw: %@", ex); }
                 @try {
                     // Hide first, then dismiss on the next runloop tick so no
                     // UIView* teardown overlaps the Swift app's resume path.
@@ -721,6 +724,96 @@ static void AGMarkAuthorized(NSString *token) {
     _agCachedToken = [token copy];
     _agAuthorized = YES;
     AGInstallSessionSwizzle();
+}
+
+// ---------------------------------------------------------------------------
+// Bundled patch seeding — ship default .3105 packs in the bundle and feed
+// them to the app's own import pathway once, after the user authorizes.
+// Runs through +[UIApplication openURL:…] so the PatchLibrary DB records a
+// normal import; guarded by a UserDefaults flag so later user deletes/moves
+// aren't clobbered on next launch.
+// ---------------------------------------------------------------------------
+
+static BOOL AGFeedPatchToApp(NSURL *fileURL) {
+    __block BOOL delivered = NO;
+    id<UIApplicationDelegate> del = [UIApplication sharedApplication].delegate;
+    if ([del respondsToSelector:@selector(application:openURL:options:)]) {
+        NSDictionary *opts = @{
+            UIApplicationOpenURLOptionsOpenInPlaceKey: @(NO),
+            UIApplicationOpenURLOptionsSourceApplicationKey: @"com.apple.DocumentsApp",
+        };
+        @try {
+            if ([del application:[UIApplication sharedApplication] openURL:fileURL options:opts]) {
+                delivered = YES;
+            }
+        } @catch (NSException *ex) {
+            NSLog(@"[AuthGate] openURL delegate threw: %@", ex);
+        }
+    }
+    if (!delivered && NSClassFromString(@"UIOpenURLContext")) {
+        Class ctxCls = NSClassFromString(@"UIOpenURLContext");
+        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
+            id sd = s.delegate;
+            if (![sd respondsToSelector:@selector(scene:openURLContexts:)]) continue;
+            @try {
+                id ctx = [[ctxCls alloc] init];
+                [ctx setValue:fileURL forKey:@"URL"];
+                [sd scene:s openURLContexts:[NSSet setWithObject:ctx]];
+                delivered = YES;
+            } @catch (NSException *ex) {
+                NSLog(@"[AuthGate] scene openURL threw: %@", ex);
+            }
+        }
+    }
+    return delivered;
+}
+
+static void AGSeedBundledPatches(void) {
+    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v4";
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    if ([ud boolForKey:kSeededKey]) return;
+
+    NSString *src = [[NSBundle mainBundle].bundlePath
+                        stringByAppendingPathComponent:@"BundledPatches"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:src isDirectory:&isDir] || !isDir) return;
+
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:src error:nil];
+    NSMutableArray<NSURL *> *targets = [NSMutableArray array];
+    NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ByteSeed"];
+    [fm createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *name in entries) {
+        if (![[name pathExtension] isEqualToString:@"3105"]) continue;
+        NSString *srcPath = [src stringByAppendingPathComponent:name];
+        NSString *dstPath = [tmpDir stringByAppendingPathComponent:name];
+        [fm removeItemAtPath:dstPath error:nil];
+        if ([fm copyItemAtPath:srcPath toPath:dstPath error:nil]) {
+            [targets addObject:[NSURL fileURLWithPath:dstPath]];
+        }
+    }
+    if (targets.count == 0) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSUInteger ok = 0;
+        for (NSURL *u in targets) {
+            if (AGFeedPatchToApp(u)) ok++;
+            [NSThread sleepForTimeInterval:0.2];
+        }
+        NSLog(@"[AuthGate] seeded %lu / %lu bundled patches",
+              (unsigned long)ok, (unsigned long)targets.count);
+        if (ok == targets.count) {
+            [ud setBool:YES forKey:kSeededKey];
+            [ud synchronize];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                for (NSURL *u in targets) {
+                    [[NSFileManager defaultManager] removeItemAtURL:u error:nil];
+                }
+            });
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
