@@ -19,6 +19,7 @@
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <sys/sysctl.h>
 #import <sys/utsname.h>
 #import <CommonCrypto/CommonCrypto.h>
@@ -740,65 +741,68 @@ static void AGMarkAuthorized(NSString *token) {
 // Opening that URL through UIApplication routes back to this process via
 // scene URL contexts → SwiftUI onOpenURL → the native import pipeline, with
 // the proper StateObject context (impossible to reconstruct from a dylib).
-// Same-app UIApplication.openURL returns YES but iOS never redelivers the URL
-// to a running app via onOpenURL — "accepted" ≠ "fired". The working path is
-// to synthesise a UIOpenURLContext and hand it to the scene delegate directly;
-// SwiftUI's private scene adapter forwards contexts to its onOpenURL subscribers.
-// We wrap the file URL inside `threeoneosfive://import?url=<file-url>` so the
-// app's handler (FUN_1002c21d0 → FUN_1002c2620) classifies it as a patch file.
+// Private LaunchServices call: forces iOS to re-handle the file URL via the
+// registered UTI handler. For a .3105 file the handler is us, so iOS re-opens
+// our scene with the URL, which fires SwiftUI's onOpenURL with the real
+// subscriber context. UIApplication.openURL from the same app is a no-op for
+// same-app targets; LSApplicationWorkspace bypasses that restriction.
 static void AGFeedPatchToApp(NSURL *fileURL, void (^done)(BOOL ok)) {
-    NSCharacterSet *allowed = [NSCharacterSet URLQueryAllowedCharacterSet];
-    NSString *enc = [fileURL.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-    if (!enc.length) { if (done) done(NO); return; }
-    NSString *urlStr = [NSString stringWithFormat:@"threeoneosfive://import?url=%@", enc];
-    NSURL *openURL = [NSURL URLWithString:urlStr];
-    if (!openURL) { if (done) done(NO); return; }
+    __block NSString *diag = @"";
+    __block BOOL ok = NO;
 
-    __block BOOL delivered = NO;
-    Class ctxCls = NSClassFromString(@"UIOpenURLContext");
-    if (ctxCls) {
-        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            @try {
-                id ctx = [[ctxCls alloc] init];
-                // UIOpenURLContext has readonly URL / options — set via KVC.
-                [ctx setValue:openURL forKey:@"URL"];
-                NSSet *contexts = [NSSet setWithObject:ctx];
-                id sd = scene.delegate;
-                // SwiftUI's scene delegate is a private class that implements
-                // scene:openURLContexts:; call directly if available.
-                if ([sd respondsToSelector:@selector(scene:openURLContexts:)]) {
-                    [sd scene:scene openURLContexts:contexts];
-                    delivered = YES;
+    // Primary path: LSApplicationWorkspace openURL: (private, iOS).
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    if (wsCls) {
+        @try {
+            SEL defSel = NSSelectorFromString(@"defaultWorkspace");
+            SEL openSel = NSSelectorFromString(@"openURL:");
+            if ([wsCls respondsToSelector:defSel]) {
+                id ws = ((id(*)(id,SEL))objc_msgSend)((id)wsCls, defSel);
+                if ([ws respondsToSelector:openSel]) {
+                    BOOL r = ((BOOL(*)(id,SEL,id))objc_msgSend)(ws, openSel, fileURL);
+                    ok = r;
+                    diag = r ? @"LSWS:YES" : @"LSWS:NO";
+                } else {
+                    diag = @"LSWS:no openURL:";
                 }
-                // Also post the scene connection notification SwiftUI watches —
-                // some SwiftUI builds subscribe via NSNotificationCenter rather
-                // than delegate, so belt-and-braces.
-                [[NSNotificationCenter defaultCenter]
-                    postNotificationName:@"UISceneDidOpenURLsNotification"
-                                  object:scene
-                                userInfo:@{ @"UISceneOpenURLContexts": contexts }];
-            } @catch (NSException *ex) {
-                NSLog(@"[AuthGate] scene openURLContexts threw: %@", ex);
+            } else {
+                diag = @"LSWS:no defaultWorkspace";
             }
+        } @catch (NSException *ex) {
+            diag = [NSString stringWithFormat:@"LSWS:threw %@", ex.reason];
+        }
+    } else {
+        diag = @"LSWS:class missing";
+    }
+
+    // Fallback: scheme-wrapped URL via UIApplication.openURL if LSWS didn't take.
+    if (!ok) {
+        NSCharacterSet *allowed = [NSCharacterSet URLQueryAllowedCharacterSet];
+        NSString *enc = [fileURL.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+        NSString *urlStr = [NSString stringWithFormat:@"threeoneosfive://import?url=%@", enc];
+        NSURL *scheme = [NSURL URLWithString:urlStr];
+        if (scheme) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            @try {
+                [[UIApplication sharedApplication] openURL:scheme options:@{} completionHandler:^(BOOL r) {
+                    ok = ok || r;
+                    diag = [diag stringByAppendingFormat:@" | UIApp:%@", r ? @"YES" : @"NO"];
+                    dispatch_semaphore_signal(sem);
+                }];
+            } @catch (NSException *ex) {
+                diag = [diag stringByAppendingFormat:@" | UIApp:threw"];
+                dispatch_semaphore_signal(sem);
+            }
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
         }
     }
 
-    // Fallback: still fire UIApplication.openURL in case the device is on an
-    // iOS build where that path IS redelivered.
-    @try {
-        [[UIApplication sharedApplication] openURL:openURL
-                                           options:@{}
-                                 completionHandler:^(BOOL ok) {
-            if (done) done(delivered || ok);
-        }];
-    } @catch (NSException *ex) {
-        if (done) done(delivered);
-    }
+    NSLog(@"[AuthGate] feed %@: %@", fileURL.lastPathComponent, diag);
+    if (done) done(ok);
 }
 
 static void AGSeedBundledPatches(void) {
-    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v7";
+    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v8";
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     if ([ud boolForKey:kSeededKey]) return;
 
