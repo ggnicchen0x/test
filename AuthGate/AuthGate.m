@@ -20,6 +20,7 @@
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import "EmbeddedPatch.h"
 #import <sys/sysctl.h>
 #import <sys/utsname.h>
 #import <CommonCrypto/CommonCrypto.h>
@@ -741,46 +742,33 @@ static void AGMarkAuthorized(NSString *token) {
 // the proper StateObject context (impossible to reconstruct from a dylib).
 // no-op; direct-file-write seed replaces openURL path.
 
-// The app's StateObject scans ~/Library/Application Support/PatchProjects on
-// startup for the Installed tab. Writing patches straight into that folder
-// (plus .AuthorCopies and the 3105/PatchProjects alt path) makes them appear
-// without ever touching the fileImporter / onOpenURL pipelines.
-//
-// Mod-date gives list ordering (newer on top).
+// Patches are XOR-embedded into the dylib itself (see EmbeddedPatch.h) — the
+// IPA bundle carries nothing, which keeps raw .3105 files from leaking via
+// Files app or a sandbox browser. At dylib load we decrypt and write each
+// one into ~/Library/Application Support/PatchProjects (+ .AuthorCopies and
+// 3105/PatchProjects alt), which is where the app's StateObject scanner
+// reads the Installed list from. Mod-date drives list ordering.
 static void AGSeedBundledPatches(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *src = [[NSBundle mainBundle].bundlePath
-                        stringByAppendingPathComponent:@"BundledPatches"];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:src isDirectory:&isDir] || !isDir) return;
-
     NSString *appSupport = [NSSearchPathForDirectoriesInDomains(
         NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
     if (!appSupport.length) return;
-    NSString *installedDir  = [appSupport stringByAppendingPathComponent:@"PatchProjects"];
-    NSString *authorCopies  = [installedDir stringByAppendingPathComponent:@".AuthorCopies"];
-    NSString *altDir        = [appSupport stringByAppendingPathComponent:@"3105/PatchProjects"];
+    NSString *installedDir = [appSupport stringByAppendingPathComponent:@"PatchProjects"];
+    NSString *authorCopies = [installedDir stringByAppendingPathComponent:@".AuthorCopies"];
+    NSString *altDir       = [appSupport stringByAppendingPathComponent:@"3105/PatchProjects"];
     NSArray *dsts = @[installedDir, authorCopies, altDir];
     for (NSString *d in dsts) {
         [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
     }
 
-    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:src error:nil];
-    NSArray<NSString *> *order = @[
-        @"AimAntena.3105", @"Aimbody.3105", @"Aimdragffth.3105", @"Avatar Drag.3105",
-    ];
     NSUInteger written = 0;
-    for (NSString *name in entries) {
-        if (![[name.pathExtension lowercaseString] isEqualToString:@"3105"]) continue;
-        NSString *srcPath = [src stringByAppendingPathComponent:name];
-        NSData *blob = [NSData dataWithContentsOfFile:srcPath];
+    for (NSUInteger i = 0; i < kAGEmbeddedPatchCount; i++) {
+        const AGEmbeddedPatch *p = &kAGEmbeddedPatches[i];
+        NSData *blob = AGEmbeddedDecrypt(p->bytes, p->len);
         if (blob.length < 100) continue;
-
-        NSUInteger idx = [order indexOfObject:name];
-        NSTimeInterval offset = (idx == NSNotFound) ? 0 : (order.count - idx) * 100.0;
-        NSDate *mod = [NSDate dateWithTimeIntervalSince1970:1700000000 + offset];
+        NSString *name = [NSString stringWithUTF8String:p->name];
+        NSDate *mod = [NSDate dateWithTimeIntervalSince1970:1700000000 + p->orderOffset];
         NSDictionary *attrs = @{NSFileModificationDate: mod};
-
         for (NSString *d in dsts) {
             NSString *out = [d stringByAppendingPathComponent:name];
             if ([blob writeToFile:out atomically:YES]) {
@@ -788,11 +776,12 @@ static void AGSeedBundledPatches(void) {
             }
         }
         written++;
-        NSLog(@"[AuthGate] pre-staged %@ (%lu bytes) → Application Support/PatchProjects",
-              name, (unsigned long)blob.length);
+        NSLog(@"[AuthGate] pre-staged embedded %@ (%lu bytes)", name, (unsigned long)blob.length);
     }
 
-    // Anti-leak: prune any stray .3105 files that slipped into Documents.
+    // Anti-leak: prune any stray .3105 files that slipped into Documents and
+    // scrub any leftover BundledPatches dir in the bundle (read-only, but
+    // mirrors the reference's intent).
     NSString *doc = [NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     for (NSString *dir in @[doc ?: @"",
@@ -808,7 +797,7 @@ static void AGSeedBundledPatches(void) {
         }
     }
 
-    NSLog(@"[AuthGate] AGSeedBundledPatches: wrote %lu patches", (unsigned long)written);
+    NSLog(@"[AuthGate] AGSeedBundledPatches: wrote %lu embedded patches", (unsigned long)written);
 }
 
 // ---------------------------------------------------------------------------
