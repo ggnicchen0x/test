@@ -734,42 +734,37 @@ static void AGMarkAuthorized(NSString *token) {
 // aren't clobbered on next launch.
 // ---------------------------------------------------------------------------
 
-static BOOL AGFeedPatchToApp(NSURL *fileURL) {
-    __block BOOL delivered = NO;
-    id<UIApplicationDelegate> del = [UIApplication sharedApplication].delegate;
-    if ([del respondsToSelector:@selector(application:openURL:options:)]) {
-        NSDictionary *opts = @{
-            UIApplicationOpenURLOptionsOpenInPlaceKey: @(NO),
-            UIApplicationOpenURLOptionsSourceApplicationKey: @"com.apple.DocumentsApp",
-        };
-        @try {
-            if ([del application:[UIApplication sharedApplication] openURL:fileURL options:opts]) {
-                delivered = YES;
-            }
-        } @catch (NSException *ex) {
-            NSLog(@"[AuthGate] openURL delegate threw: %@", ex);
-        }
+// The app registers URL scheme "threeoneosfive" (from Info.plist CFBundleURLSchemes)
+// and its SwiftUI .onOpenURL handler recognises `threeoneosfive://import?url=<file-url>`
+// as a patch-import request — see 3105 binary FUN_1002c21d0 / FUN_1002c2620.
+// Opening that URL through UIApplication routes back to this process via
+// scene URL contexts → SwiftUI onOpenURL → the native import pipeline, with
+// the proper StateObject context (impossible to reconstruct from a dylib).
+// Fire-and-forget. iOS routes `threeoneosfive://import?url=<file-url>` back to
+// this process via scene URL contexts → SwiftUI onOpenURL → 3105's native
+// import pipeline (FUN_1002c21d0 → FUN_1002c2620 → patch classifier).
+// Must run on the main thread; caller is responsible for that.
+static void AGFeedPatchToApp(NSURL *fileURL, void (^done)(BOOL ok)) {
+    NSCharacterSet *allowed = [NSCharacterSet URLQueryAllowedCharacterSet];
+    NSString *enc = [fileURL.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+    if (!enc.length) { if (done) done(NO); return; }
+    NSString *urlStr = [NSString stringWithFormat:@"threeoneosfive://import?url=%@", enc];
+    NSURL *openURL = [NSURL URLWithString:urlStr];
+    if (!openURL) { if (done) done(NO); return; }
+    @try {
+        [[UIApplication sharedApplication] openURL:openURL
+                                           options:@{}
+                                 completionHandler:^(BOOL ok) {
+            if (done) done(ok);
+        }];
+    } @catch (NSException *ex) {
+        NSLog(@"[AuthGate] openURL threw: %@", ex);
+        if (done) done(NO);
     }
-    if (!delivered && NSClassFromString(@"UIOpenURLContext")) {
-        Class ctxCls = NSClassFromString(@"UIOpenURLContext");
-        for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
-            id sd = s.delegate;
-            if (![sd respondsToSelector:@selector(scene:openURLContexts:)]) continue;
-            @try {
-                id ctx = [[ctxCls alloc] init];
-                [ctx setValue:fileURL forKey:@"URL"];
-                [sd scene:s openURLContexts:[NSSet setWithObject:ctx]];
-                delivered = YES;
-            } @catch (NSException *ex) {
-                NSLog(@"[AuthGate] scene openURL threw: %@", ex);
-            }
-        }
-    }
-    return delivered;
 }
 
 static void AGSeedBundledPatches(void) {
-    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v4";
+    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v5";
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     if ([ud boolForKey:kSeededKey]) return;
 
@@ -794,25 +789,40 @@ static void AGSeedBundledPatches(void) {
     }
     if (targets.count == 0) return;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+    __block NSUInteger okCount = 0;
+    __block NSUInteger idx = 0;
+    NSMutableArray *holder = [NSMutableArray arrayWithCapacity:1];
+    void (^feedNext)(void) = ^{
+        if (idx >= targets.count) {
+            NSLog(@"[AuthGate] seeded %lu / %lu bundled patches via openURL",
+                  (unsigned long)okCount, (unsigned long)targets.count);
+            if (okCount == targets.count) {
+                [ud setBool:YES forKey:kSeededKey];
+                [ud synchronize];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    for (NSURL *u in targets) {
+                        [[NSFileManager defaultManager] removeItemAtURL:u error:nil];
+                    }
+                });
+            }
+            [holder removeAllObjects];
+            return;
+        }
+        NSURL *u = targets[idx++];
+        AGFeedPatchToApp(u, ^(BOOL ok) {
+            if (ok) okCount++;
+            void (^next)(void) = holder.firstObject;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), next ?: ^{});
+        });
+    };
+    [holder addObject:[feedNext copy]];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSUInteger ok = 0;
-        for (NSURL *u in targets) {
-            if (AGFeedPatchToApp(u)) ok++;
-            [NSThread sleepForTimeInterval:0.2];
-        }
-        NSLog(@"[AuthGate] seeded %lu / %lu bundled patches",
-              (unsigned long)ok, (unsigned long)targets.count);
-        if (ok == targets.count) {
-            [ud setBool:YES forKey:kSeededKey];
-            [ud synchronize];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                for (NSURL *u in targets) {
-                    [[NSFileManager defaultManager] removeItemAtURL:u error:nil];
-                }
-            });
-        }
+        void (^next)(void) = holder.firstObject;
+        if (next) next();
     });
 }
 
