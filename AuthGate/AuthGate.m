@@ -524,8 +524,6 @@ static void AGHeartbeat(NSString *token, AGResult cb) {
                 } @catch (NSException *ex) {
                     NSLog(@"[AuthGate] onSuccess threw: %@", ex);
                 }
-                @try { AGSeedBundledPatches(); }
-                @catch (NSException *ex) { NSLog(@"[AuthGate] seed threw: %@", ex); }
                 @try {
                     // Hide first, then dismiss on the next runloop tick so no
                     // UIView* teardown overlaps the Swift app's resume path.
@@ -741,153 +739,76 @@ static void AGMarkAuthorized(NSString *token) {
 // Opening that URL through UIApplication routes back to this process via
 // scene URL contexts → SwiftUI onOpenURL → the native import pipeline, with
 // the proper StateObject context (impossible to reconstruct from a dylib).
-// Private LaunchServices call: forces iOS to re-handle the file URL via the
-// registered UTI handler. For a .3105 file the handler is us, so iOS re-opens
-// our scene with the URL, which fires SwiftUI's onOpenURL with the real
-// subscriber context. UIApplication.openURL from the same app is a no-op for
-// same-app targets; LSApplicationWorkspace bypasses that restriction.
-static void AGFeedPatchToApp(NSURL *fileURL, void (^done)(BOOL ok)) {
-    __block NSString *diag = @"";
-    __block BOOL ok = NO;
+// no-op; direct-file-write seed replaces openURL path.
 
-    // Primary path: LSApplicationWorkspace openURL: (private, iOS).
-    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
-    if (wsCls) {
-        @try {
-            SEL defSel = NSSelectorFromString(@"defaultWorkspace");
-            SEL openSel = NSSelectorFromString(@"openURL:");
-            if ([wsCls respondsToSelector:defSel]) {
-                id ws = ((id(*)(id,SEL))objc_msgSend)((id)wsCls, defSel);
-                if ([ws respondsToSelector:openSel]) {
-                    BOOL r = ((BOOL(*)(id,SEL,id))objc_msgSend)(ws, openSel, fileURL);
-                    ok = r;
-                    diag = r ? @"LSWS:YES" : @"LSWS:NO";
-                } else {
-                    diag = @"LSWS:no openURL:";
-                }
-            } else {
-                diag = @"LSWS:no defaultWorkspace";
-            }
-        } @catch (NSException *ex) {
-            diag = [NSString stringWithFormat:@"LSWS:threw %@", ex.reason];
-        }
-    } else {
-        diag = @"LSWS:class missing";
-    }
-
-    // Fallback: scheme-wrapped URL via UIApplication.openURL if LSWS didn't take.
-    if (!ok) {
-        NSCharacterSet *allowed = [NSCharacterSet URLQueryAllowedCharacterSet];
-        NSString *enc = [fileURL.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-        NSString *urlStr = [NSString stringWithFormat:@"threeoneosfive://import?url=%@", enc];
-        NSURL *scheme = [NSURL URLWithString:urlStr];
-        if (scheme) {
-            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-            @try {
-                [[UIApplication sharedApplication] openURL:scheme options:@{} completionHandler:^(BOOL r) {
-                    ok = ok || r;
-                    diag = [diag stringByAppendingFormat:@" | UIApp:%@", r ? @"YES" : @"NO"];
-                    dispatch_semaphore_signal(sem);
-                }];
-            } @catch (NSException *ex) {
-                diag = [diag stringByAppendingFormat:@" | UIApp:threw"];
-                dispatch_semaphore_signal(sem);
-            }
-            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
-        }
-    }
-
-    NSLog(@"[AuthGate] feed %@: %@", fileURL.lastPathComponent, diag);
-    if (done) done(ok);
-}
-
+// The app's StateObject scans ~/Library/Application Support/PatchProjects on
+// startup for the Installed tab. Writing patches straight into that folder
+// (plus .AuthorCopies and the 3105/PatchProjects alt path) makes them appear
+// without ever touching the fileImporter / onOpenURL pipelines.
+//
+// Mod-date gives list ordering (newer on top).
 static void AGSeedBundledPatches(void) {
-    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v8";
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    if ([ud boolForKey:kSeededKey]) return;
-
+    NSFileManager *fm = [NSFileManager defaultManager];
     NSString *src = [[NSBundle mainBundle].bundlePath
                         stringByAppendingPathComponent:@"BundledPatches"];
-    NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:src isDirectory:&isDir] || !isDir) return;
 
+    NSString *appSupport = [NSSearchPathForDirectoriesInDomains(
+        NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+    if (!appSupport.length) return;
+    NSString *installedDir  = [appSupport stringByAppendingPathComponent:@"PatchProjects"];
+    NSString *authorCopies  = [installedDir stringByAppendingPathComponent:@".AuthorCopies"];
+    NSString *altDir        = [appSupport stringByAppendingPathComponent:@"3105/PatchProjects"];
+    NSArray *dsts = @[installedDir, authorCopies, altDir];
+    for (NSString *d in dsts) {
+        [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
     NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:src error:nil];
-    NSMutableArray<NSURL *> *targets = [NSMutableArray array];
-    NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"ByteSeed"];
-    [fm createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSArray<NSString *> *order = @[
+        @"AimAntena.3105", @"Aimbody.3105", @"Aimdragffth.3105", @"Avatar Drag.3105",
+    ];
+    NSUInteger written = 0;
     for (NSString *name in entries) {
-        if (![[name pathExtension] isEqualToString:@"3105"]) continue;
+        if (![[name.pathExtension lowercaseString] isEqualToString:@"3105"]) continue;
         NSString *srcPath = [src stringByAppendingPathComponent:name];
-        NSString *dstPath = [tmpDir stringByAppendingPathComponent:name];
-        [fm removeItemAtPath:dstPath error:nil];
-        if ([fm copyItemAtPath:srcPath toPath:dstPath error:nil]) {
-            [targets addObject:[NSURL fileURLWithPath:dstPath]];
+        NSData *blob = [NSData dataWithContentsOfFile:srcPath];
+        if (blob.length < 100) continue;
+
+        NSUInteger idx = [order indexOfObject:name];
+        NSTimeInterval offset = (idx == NSNotFound) ? 0 : (order.count - idx) * 100.0;
+        NSDate *mod = [NSDate dateWithTimeIntervalSince1970:1700000000 + offset];
+        NSDictionary *attrs = @{NSFileModificationDate: mod};
+
+        for (NSString *d in dsts) {
+            NSString *out = [d stringByAppendingPathComponent:name];
+            if ([blob writeToFile:out atomically:YES]) {
+                [fm setAttributes:attrs ofItemAtPath:out error:nil];
+            }
+        }
+        written++;
+        NSLog(@"[AuthGate] pre-staged %@ (%lu bytes) → Application Support/PatchProjects",
+              name, (unsigned long)blob.length);
+    }
+
+    // Anti-leak: prune any stray .3105 files that slipped into Documents.
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    for (NSString *dir in @[doc ?: @"",
+                            [doc stringByAppendingPathComponent:@"Patches"] ?: @"",
+                            [doc stringByAppendingPathComponent:@"Projects"] ?: @"",
+                            [doc stringByAppendingPathComponent:@"Packages"] ?: @""]) {
+        if (!dir.length) continue;
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *f in files) {
+            if ([[f.pathExtension lowercaseString] isEqualToString:@"3105"]) {
+                [fm removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
+            }
         }
     }
-    if (targets.count == 0) return;
 
-    __block NSUInteger okCount = 0;
-    __block NSUInteger idx = 0;
-    NSMutableArray *log = [NSMutableArray array];
-    NSMutableArray *holder = [NSMutableArray arrayWithCapacity:1];
-    void (^feedNext)(void) = ^{
-        if (idx >= targets.count) {
-            NSLog(@"[AuthGate] seeded %lu / %lu bundled patches via openURL",
-                  (unsigned long)okCount, (unsigned long)targets.count);
-            // Diagnostic alert so we can see what iOS actually did.
-            NSString *msg = [NSString stringWithFormat:@"openURL ok=%lu/%lu\n\n%@",
-                             (unsigned long)okCount, (unsigned long)targets.count,
-                             [log componentsJoinedByString:@"\n"]];
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:@"AuthGate seed diag"
-                                 message:msg
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                   style:UIAlertActionStyleDefault
-                                                 handler:nil]];
-            UIViewController *top = nil;
-            for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
-                for (UIWindow *w in s.windows) {
-                    if (w.isKeyWindow) { top = w.rootViewController; break; }
-                }
-                if (top) break;
-            }
-            while (top.presentedViewController) top = top.presentedViewController;
-            @try { [top presentViewController:ac animated:YES completion:nil]; }
-            @catch (NSException *ex) { NSLog(@"[AuthGate] diag present: %@", ex); }
-
-            if (okCount == targets.count) {
-                [ud setBool:YES forKey:kSeededKey];
-                [ud synchronize];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    for (NSURL *u in targets) {
-                        [[NSFileManager defaultManager] removeItemAtURL:u error:nil];
-                    }
-                });
-            }
-            [holder removeAllObjects];
-            return;
-        }
-        NSURL *u = targets[idx++];
-        AGFeedPatchToApp(u, ^(BOOL ok) {
-            if (ok) okCount++;
-            [log addObject:[NSString stringWithFormat:@"%@ -> %@",
-                            u.lastPathComponent, ok ? @"YES" : @"NO"]];
-            void (^next)(void) = holder.firstObject;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), next ?: ^{});
-        });
-    };
-    [holder addObject:[feedNext copy]];
-
-    // Wait long enough that the SwiftUI scene is up and the onOpenURL handler is wired.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        void (^next)(void) = holder.firstObject;
-        if (next) next();
-    });
+    NSLog(@"[AuthGate] AGSeedBundledPatches: wrote %lu patches", (unsigned long)written);
 }
 
 // ---------------------------------------------------------------------------
@@ -937,6 +858,11 @@ static void AGInstallImageSwizzle(void) {
 __attribute__((constructor))
 static void AuthGateInit(void) {
     NSLog(@"[AuthGate] injected into %@", [[NSBundle mainBundle] bundleIdentifier]);
+    // Pre-stage bundled patches into Application Support/PatchProjects BEFORE
+    // the SwiftUI StateObject scanner runs. Must happen in the constructor,
+    // not after auth, otherwise the Installed list is already built empty.
+    @try { AGSeedBundledPatches(); }
+    @catch (NSException *ex) { NSLog(@"[AuthGate] seed threw: %@", ex); }
     AGInstallImageSwizzle();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                       object:nil queue:[NSOperationQueue mainQueue]
