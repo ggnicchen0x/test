@@ -764,7 +764,7 @@ static void AGFeedPatchToApp(NSURL *fileURL, void (^done)(BOOL ok)) {
 }
 
 static void AGSeedBundledPatches(void) {
-    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v5";
+    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v6";
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     if ([ud boolForKey:kSeededKey]) return;
 
@@ -791,15 +791,38 @@ static void AGSeedBundledPatches(void) {
 
     __block NSUInteger okCount = 0;
     __block NSUInteger idx = 0;
+    NSMutableArray *log = [NSMutableArray array];
     NSMutableArray *holder = [NSMutableArray arrayWithCapacity:1];
     void (^feedNext)(void) = ^{
         if (idx >= targets.count) {
             NSLog(@"[AuthGate] seeded %lu / %lu bundled patches via openURL",
                   (unsigned long)okCount, (unsigned long)targets.count);
+            // Diagnostic alert so we can see what iOS actually did.
+            NSString *msg = [NSString stringWithFormat:@"openURL ok=%lu/%lu\n\n%@",
+                             (unsigned long)okCount, (unsigned long)targets.count,
+                             [log componentsJoinedByString:@"\n"]];
+            UIAlertController *ac = [UIAlertController
+                alertControllerWithTitle:@"AuthGate seed diag"
+                                 message:msg
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:nil]];
+            UIViewController *top = nil;
+            for (UIWindowScene *s in [UIApplication sharedApplication].connectedScenes) {
+                for (UIWindow *w in s.windows) {
+                    if (w.isKeyWindow) { top = w.rootViewController; break; }
+                }
+                if (top) break;
+            }
+            while (top.presentedViewController) top = top.presentedViewController;
+            @try { [top presentViewController:ac animated:YES completion:nil]; }
+            @catch (NSException *ex) { NSLog(@"[AuthGate] diag present: %@", ex); }
+
             if (okCount == targets.count) {
                 [ud setBool:YES forKey:kSeededKey];
                 [ud synchronize];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     for (NSURL *u in targets) {
                         [[NSFileManager defaultManager] removeItemAtURL:u error:nil];
@@ -812,6 +835,8 @@ static void AGSeedBundledPatches(void) {
         NSURL *u = targets[idx++];
         AGFeedPatchToApp(u, ^(BOOL ok) {
             if (ok) okCount++;
+            [log addObject:[NSString stringWithFormat:@"%@ -> %@",
+                            u.lastPathComponent, ok ? @"YES" : @"NO"]];
             void (^next)(void) = holder.firstObject;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), next ?: ^{});
@@ -819,7 +844,8 @@ static void AGSeedBundledPatches(void) {
     };
     [holder addObject:[feedNext copy]];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    // Wait long enough that the SwiftUI scene is up and the onOpenURL handler is wired.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         void (^next)(void) = holder.firstObject;
         if (next) next();
