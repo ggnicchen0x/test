@@ -1,0 +1,31 @@
+name: build-authgate
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "AuthGate/**"
+      - ".github/workflows/build-authgate.yml"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos -f clang
+
+      - name: Build AuthGate.dylib
+        working-directory: AuthGate
+        run: make
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuthGate-dylib
+          path: AuthGate/AuthGate.dylib
+          if-no-files-found: error

@@ -1,0 +1,7 @@
+*.ipa
+*.dylib
+Payload/
+_artifact/
+__pycache__/
+*.pyc
+.DS_Store
