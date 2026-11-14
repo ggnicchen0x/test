@@ -724,12 +724,53 @@ static void AGMarkAuthorized(NSString *token) {
 }
 
 // ---------------------------------------------------------------------------
+// UIImage swizzle — replace the app's "AppIcon" references with AppLogo.png
+// shipped at the bundle root. The Swift app loads the icon through
+// +[UIImage imageNamed:], so intercepting that one call replaces every
+// in-app occurrence of the icon.
+// ---------------------------------------------------------------------------
+
+static UIImage *(*_ag_orig_imageNamed)(id, SEL, NSString *) = NULL;
+
+static UIImage *ag_swz_imageNamed(id self_, SEL _cmd, NSString *name) {
+    if (name.length) {
+        NSString *lo = [name lowercaseString];
+        if ([lo containsString:@"appicon"] ||
+            [lo isEqualToString:@"logo"] ||
+            [lo isEqualToString:@"applogo"] ||
+            [lo isEqualToString:@"brandlogo"]) {
+            static UIImage *cached = nil;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{
+                NSString *p = [[NSBundle mainBundle].bundlePath
+                                stringByAppendingPathComponent:@"AppLogo.png"];
+                cached = [UIImage imageWithContentsOfFile:p];
+            });
+            if (cached) return cached;
+        }
+    }
+    return _ag_orig_imageNamed(self_, _cmd, name);
+}
+
+static void AGInstallImageSwizzle(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Method m = class_getClassMethod([UIImage class], @selector(imageNamed:));
+        if (!m) return;
+        _ag_orig_imageNamed = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)ag_swz_imageNamed);
+        NSLog(@"[AuthGate] UIImage imageNamed: swizzled -> AppLogo.png");
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Entry: dylib load constructor
 // ---------------------------------------------------------------------------
 
 __attribute__((constructor))
 static void AuthGateInit(void) {
     NSLog(@"[AuthGate] injected into %@", [[NSBundle mainBundle] bundleIdentifier]);
+    AGInstallImageSwizzle();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                       object:nil queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *n) {
