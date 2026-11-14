@@ -740,10 +740,12 @@ static void AGMarkAuthorized(NSString *token) {
 // Opening that URL through UIApplication routes back to this process via
 // scene URL contexts → SwiftUI onOpenURL → the native import pipeline, with
 // the proper StateObject context (impossible to reconstruct from a dylib).
-// Fire-and-forget. iOS routes `threeoneosfive://import?url=<file-url>` back to
-// this process via scene URL contexts → SwiftUI onOpenURL → 3105's native
-// import pipeline (FUN_1002c21d0 → FUN_1002c2620 → patch classifier).
-// Must run on the main thread; caller is responsible for that.
+// Same-app UIApplication.openURL returns YES but iOS never redelivers the URL
+// to a running app via onOpenURL — "accepted" ≠ "fired". The working path is
+// to synthesise a UIOpenURLContext and hand it to the scene delegate directly;
+// SwiftUI's private scene adapter forwards contexts to its onOpenURL subscribers.
+// We wrap the file URL inside `threeoneosfive://import?url=<file-url>` so the
+// app's handler (FUN_1002c21d0 → FUN_1002c2620) classifies it as a patch file.
 static void AGFeedPatchToApp(NSURL *fileURL, void (^done)(BOOL ok)) {
     NSCharacterSet *allowed = [NSCharacterSet URLQueryAllowedCharacterSet];
     NSString *enc = [fileURL.absoluteString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
@@ -751,20 +753,52 @@ static void AGFeedPatchToApp(NSURL *fileURL, void (^done)(BOOL ok)) {
     NSString *urlStr = [NSString stringWithFormat:@"threeoneosfive://import?url=%@", enc];
     NSURL *openURL = [NSURL URLWithString:urlStr];
     if (!openURL) { if (done) done(NO); return; }
+
+    __block BOOL delivered = NO;
+    Class ctxCls = NSClassFromString(@"UIOpenURLContext");
+    if (ctxCls) {
+        for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            @try {
+                id ctx = [[ctxCls alloc] init];
+                // UIOpenURLContext has readonly URL / options — set via KVC.
+                [ctx setValue:openURL forKey:@"URL"];
+                NSSet *contexts = [NSSet setWithObject:ctx];
+                id sd = scene.delegate;
+                // SwiftUI's scene delegate is a private class that implements
+                // scene:openURLContexts:; call directly if available.
+                if ([sd respondsToSelector:@selector(scene:openURLContexts:)]) {
+                    [sd scene:scene openURLContexts:contexts];
+                    delivered = YES;
+                }
+                // Also post the scene connection notification SwiftUI watches —
+                // some SwiftUI builds subscribe via NSNotificationCenter rather
+                // than delegate, so belt-and-braces.
+                [[NSNotificationCenter defaultCenter]
+                    postNotificationName:@"UISceneDidOpenURLsNotification"
+                                  object:scene
+                                userInfo:@{ @"UISceneOpenURLContexts": contexts }];
+            } @catch (NSException *ex) {
+                NSLog(@"[AuthGate] scene openURLContexts threw: %@", ex);
+            }
+        }
+    }
+
+    // Fallback: still fire UIApplication.openURL in case the device is on an
+    // iOS build where that path IS redelivered.
     @try {
         [[UIApplication sharedApplication] openURL:openURL
                                            options:@{}
                                  completionHandler:^(BOOL ok) {
-            if (done) done(ok);
+            if (done) done(delivered || ok);
         }];
     } @catch (NSException *ex) {
-        NSLog(@"[AuthGate] openURL threw: %@", ex);
-        if (done) done(NO);
+        if (done) done(delivered);
     }
 }
 
 static void AGSeedBundledPatches(void) {
-    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v6";
+    NSString * const kSeededKey = @"AuthGate.PatchesSeeded.v7";
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     if ([ud boolForKey:kSeededKey]) return;
 
